@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TARGET = "http://127.0.0.1:1235"
 MAX_PROMPT_TOKENS = 61000   # Dispara limpieza antes de tocar los 65,536 de la 9070 XT
-KEEP_TARGET_TOKENS = 48000  # Conserva tus instrucciones completas + historial reciente con amplio margen
+KEEP_TARGET_TOKENS = 38000  # Conserva tus instrucciones completas + historial reciente con amplio margen
 MAX_GEN_TOKENS = 16384      # Evita bucles gigantes de escritura que llenen los 65,536 tokens
 FAST_SKIP_CHARS = 115000    # Debajo de ~115k chars (~32k tok reales) evita llamadas HTTP previas de tokenizado
 PROGRESS_PATH = r"C:\Julio\Agente\progreso.md"
@@ -256,6 +256,34 @@ def read_active_progress(max_chars: int = 4000) -> str:
     return ""
 
 
+
+RE_FAST_CMD = re.compile(r"^((?:\s*<[^>]+>[^<]*</[^>]+>\s*)*)/fast(?:[\s:\-\t\r\n]+|$)", re.I)
+
+
+def apply_thinking_switch(messages: list) -> bool:
+    """Detecta /fast incluso despues de etiquetas XML como <current_datetime> y lo limpia."""
+    if not messages:
+        return True
+    last = messages[-1]
+    if not is_real_user_msg(last):
+        return True
+    txt = extract_text(last.get("content"))
+    if not RE_FAST_CMD.match(txt):
+        return True
+    m = dict(last)
+    if isinstance(m.get("content"), str):
+        m["content"] = RE_FAST_CMD.sub(r"\1", m["content"], count=1)
+    elif isinstance(m.get("content"), list):
+        parts = [dict(part) if isinstance(part, dict) else part for part in m["content"]]
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str) and RE_FAST_CMD.match(part["text"]):
+                part["text"] = RE_FAST_CMD.sub(r"\1", part["text"], count=1)
+                break
+        m["content"] = parts
+    messages[-1] = m
+    return False
+
+
 def inspect_incoming(messages: list, tools: list = None, req_params: dict = None, tools_filter_info: tuple = (0, 0)) -> dict:
     sys_texts = []
     non_sys_texts = []
@@ -280,10 +308,14 @@ def inspect_incoming(messages: list, tools: list = None, req_params: dict = None
                 role_chars["user"] += c_len
             elif r == "assistant":
                 role_counts["asst"] += 1
-                role_chars["asst"] += c_len
+                r_txt = m.get("reasoning_content") or m.get("reasoning") or ""
+                tc_chars = 0
                 for tc in m.get("tool_calls") or []:
-                    fn_name = (tc.get("function") or {}).get("name") or "tool"
+                    fn_obj = tc.get("function") or {}
+                    fn_name = fn_obj.get("name") or "tool"
                     hist_tools[fn_name] = hist_tools.get(fn_name, 0) + 1
+                    tc_chars += len(fn_name) + len(str(fn_obj.get("arguments") or ""))
+                role_chars["asst"] += c_len + len(str(r_txt)) + tc_chars
             elif r == "tool":
                 role_counts["tool"] += 1
                 role_chars["tool"] += c_len
@@ -375,7 +407,16 @@ def prune_if_needed(messages: list, tools: list = None, approx_chars: int = None
         return messages, 0, None
 
     if approx_chars is None:
-        approx_chars = sum(len(extract_text(m.get("content"))) for m in messages) + get_tools_chars(tools)
+        approx_chars = sum(
+            len(extract_text(m.get("content")))
+            + len(str(m.get("reasoning_content") or m.get("reasoning") or ""))
+            + sum(
+                len(str(((tc.get("function") or {}).get("name") or "")))
+                + len(str(((tc.get("function") or {}).get("arguments") or "")))
+                for tc in (m.get("tool_calls") or [])
+            )
+            for m in messages
+        ) + get_tools_chars(tools)
 
     if approx_chars < FAST_SKIP_CHARS:
         est_tok = max(int(approx_chars / 3.6), 1)
@@ -529,6 +570,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     tools_filter_info = (orig_cnt, saved_c)
 
                 if is_chat:
+                    think_on = apply_thinking_switch(body.get("messages") or [])
+                    ctk = body.get("chat_template_kwargs")
+                    if not isinstance(ctk, dict):
+                        ctk = {}
+                    ctk["enable_thinking"] = think_on
+                    body["chat_template_kwargs"] = ctk
                     cur_max = body.get("max_tokens")
                     if not isinstance(cur_max, int) or cur_max <= 0 or cur_max > MAX_GEN_TOKENS:
                         body["max_tokens"] = MAX_GEN_TOKENS
@@ -544,6 +591,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "top_p": body.get("top_p", "def"),
                         "max_tok": body.get("max_tokens"),
                         "stream": is_stream,
+                        "think": "DEEP" if think_on else "FAST",
                     }
                 else:
                     req_params = {}
@@ -715,7 +763,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         f"[{now_str}] {label} [CTX: {ctx_tokens_sent} tok | roles(sys={r['sys']}/{rc['sys']}c, "
                         f"u={r['user']}/{rc['user']}c, a={r['asst']}/{rc['asst']}c, t={r['tool']}/{rc['tool']}c) | "
                         f"schemas={sc_tag} | hist_tools={ht_str} | "
-                        f"params(temp={rp.get('temp')},top_p={rp.get('top_p')},max={rp.get('max_tok')},stream={rp.get('stream')})] "
+                        f"params(temp={rp.get('temp')},top_p={rp.get('top_p')},max={rp.get('max_tok')},stream={rp.get('stream')},think={rp.get('think')})] "
                         f"{meta_in['trigger_info']}"
                     )
 
