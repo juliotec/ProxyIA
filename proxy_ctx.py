@@ -10,8 +10,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TARGET = "http://127.0.0.1:1235"
-MAX_PROMPT_TOKENS = 60000   # Dispara limpieza antes de tocar los 65,536 de la 9070 XT
-KEEP_TARGET_TOKENS = 42000  # Conserva tus instrucciones completas + historial reciente con amplio margen
+MAX_PROMPT_TOKENS = 61000   # Dispara limpieza antes de tocar los 65,536 de la 9070 XT
+KEEP_TARGET_TOKENS = 48000  # Conserva tus instrucciones completas + historial reciente con amplio margen
 MAX_GEN_TOKENS = 16384      # Evita bucles gigantes de escritura que llenen los 65,536 tokens
 FAST_SKIP_CHARS = 115000    # Debajo de ~115k chars (~32k tok reales) evita llamadas HTTP previas de tokenizado
 PROGRESS_PATH = r"C:\Julio\Agente\progreso.md"
