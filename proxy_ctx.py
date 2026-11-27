@@ -13,7 +13,7 @@ TARGET = "http://127.0.0.1:1235"
 MAX_PROMPT_TOKENS = 61000   # Dispara limpieza antes de tocar los 65,536 de la 9070 XT
 KEEP_TARGET_TOKENS = 38000  # Conserva tus instrucciones completas + historial reciente con amplio margen
 MAX_GEN_TOKENS = 16384      # Evita bucles gigantes de escritura que llenen los 65,536 tokens
-FAST_SKIP_CHARS = 115000    # Debajo de ~115k chars (~32k tok reales) evita llamadas HTTP previas de tokenizado
+FAST_SKIP_CHARS = 185000    # Debajo de ~185k chars (~51k tok reales) evita llamadas HTTP previas de tokenizado
 PROGRESS_PATH = r"C:\Julio\Agente\progreso.md"
 
 # Whitelist de herramientas permitidas (el resto de los 27 schemas de VS se filtran para ahorrar ~8,160 tokens):
@@ -43,11 +43,13 @@ RE_READ_CMD = re.compile(r"(?:get-content|select-string|readalllines|readalltext
 
 STATE = {
     "order_num": 0,
+    "last_user_hash": "",
     "step_num": 0,
-    "last_sig": "",
+    "recent_sigs": [],
     "repeat_count": 0,
     "ide_compacted": False,
     "consec_reads": 0,
+    "fast_mode": False,
 }
 
 
@@ -235,7 +237,7 @@ def inject_hint_into_last_user(messages: list, hint: str) -> None:
     if not hint:
         return
     for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "user":
+        if is_real_user_msg(messages[i]):
             m = dict(messages[i])
             orig = extract_text(m.get("content"))
             if hint not in orig:
@@ -256,31 +258,50 @@ def read_active_progress(max_chars: int = 4000) -> str:
     return ""
 
 
-
-RE_FAST_CMD = re.compile(r"^((?:\s*<[^>]+>[^<]*</[^>]+>\s*)*)/fast(?:[\s:\-\t\r\n]+|$)", re.I)
+# Comando rapido al inicio del prompt:
+#   !fast -> Apaga <think> (0 tokens de razonamiento) y aplica temp=0.15, top_p=0.8, presence_penalty=0.0, max_tokens=4096
+RE_FAST_CMD = re.compile(r"(?:^|\n|>)\s*!fast(?:[\s:\-\t\r\n]+|$)", re.I)
 
 
 def apply_thinking_switch(messages: list) -> bool:
-    """Detecta /fast incluso despues de etiquetas XML como <current_datetime> y lo limpia."""
+    """Detecta !fast en el ultimo mensaje real del usuario y mantiene el estado en toda la orden."""
     if not messages:
         return True
-    last = messages[-1]
-    if not is_real_user_msg(last):
+
+    if messages[-1].get("role") == "tool":
+        with STATE_LOCK:
+            return not STATE.get("fast_mode", False)
+
+    last_user_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if is_real_user_msg(messages[i]):
+            last_user_idx = i
+            break
+
+    if last_user_idx == -1:
         return True
-    txt = extract_text(last.get("content"))
-    if not RE_FAST_CMD.match(txt):
+
+    target = dict(messages[last_user_idx])
+    txt = extract_text(target.get("content"))
+    m_fast = RE_FAST_CMD.search(txt)
+
+    with STATE_LOCK:
+        STATE["fast_mode"] = bool(m_fast)
+
+    if not m_fast:
         return True
-    m = dict(last)
-    if isinstance(m.get("content"), str):
-        m["content"] = RE_FAST_CMD.sub(r"\1", m["content"], count=1)
-    elif isinstance(m.get("content"), list):
-        parts = [dict(part) if isinstance(part, dict) else part for part in m["content"]]
+
+    if isinstance(target.get("content"), str):
+        target["content"] = RE_FAST_CMD.sub(" ", target["content"], count=1).strip()
+    elif isinstance(target.get("content"), list):
+        parts = [dict(part) if isinstance(part, dict) else part for part in target["content"]]
         for part in parts:
-            if isinstance(part, dict) and isinstance(part.get("text"), str) and RE_FAST_CMD.match(part["text"]):
-                part["text"] = RE_FAST_CMD.sub(r"\1", part["text"], count=1)
+            if isinstance(part, dict) and isinstance(part.get("text"), str) and RE_FAST_CMD.search(part["text"]):
+                part["text"] = RE_FAST_CMD.sub(" ", part["text"], count=1).strip()
                 break
-        m["content"] = parts
-    messages[-1] = m
+        target["content"] = parts
+
+    messages[last_user_idx] = target
     return False
 
 
@@ -336,19 +357,27 @@ def inspect_incoming(messages: list, tools: list = None, req_params: dict = None
     last_msg, last_txt = non_sys[-1] if non_sys else ({}, "")
     last_role = last_msg.get("role", "")
 
+    real_user_txt = ""
+    for m_u, t_u in reversed(non_sys):
+        if is_real_user_msg(m_u):
+            real_user_txt = t_u
+            break
+    user_digest = hashlib.sha1(real_user_txt.encode("utf-8", errors="ignore")).hexdigest() if real_user_txt else ""
+
     runtime_hints = []
     with STATE_LOCK:
         if STATE.pop("force_break_loop", False):
-            runtime_hints.append("[AVISO CRITICO DEL PROXY: Acabas de repetir exactamente la misma llamada a herramienta. PROHIBIDO repetirla: avanza inmediatamente al siguiente paso de ejecucion o edicion.]")
+            runtime_hints.append("[AVISO CRITICO DEL PROXY: Acabas de repetir una llamada o ciclo de lectura/herramienta (incluso cambiando numeros de archivo o rangos). PROHIBIDO repetirlo: usa la informacion que ya tienes en pantalla y responde o avanza al siguiente paso ahora.]")
         if is_ide_compaction_prompt(last_msg):
             STATE["ide_compacted"] = True
             STATE["consec_reads"] = 0
             label = f"[ORDEN #{STATE['order_num']} | COMPACT-IDE]"
             trigger_info = f'IDECompact({len(last_txt)}c)'
-        elif is_real_user_msg(last_msg):
+        elif user_digest and user_digest != STATE.get("last_user_hash", "") and last_role != "tool":
+            STATE["last_user_hash"] = user_digest
             STATE["order_num"] += 1
             STATE["step_num"] = 0
-            STATE["last_sig"] = ""
+            STATE["recent_sigs"] = []
             STATE["repeat_count"] = 0
             STATE["consec_reads"] = 0
             if STATE["ide_compacted"]:
@@ -359,7 +388,7 @@ def inspect_incoming(messages: list, tools: list = None, req_params: dict = None
                 else:
                     runtime_hints.append("[AVISO PROXY POST-COMPACTACION: Visual Studio compacto el historial. NO vuelvas a leer archivos largos. Crea C:\\Julio\\Agente\\progreso.md YA como primera accion y ejecuta los cambios via script Python en C:\\Julio\\Agente\\Temp sin imprimir archivos largos.]")
             label = f"[ORDEN #{STATE['order_num']}]"
-            trigger_info = f'UserReq({len(last_txt)}c): "{compact_snippet(last_txt, 220)}"'
+            trigger_info = f'UserReq({len(real_user_txt)}c): "{compact_snippet(real_user_txt, 220)}"'
         else:
             if STATE["order_num"] == 0:
                 STATE["order_num"] = 1
@@ -373,6 +402,8 @@ def inspect_incoming(messages: list, tools: list = None, req_params: dict = None
             is_read = t_name in ("get_file", "view", "view_range", "grep") or (t_name == "powershell" and len(last_txt) > 3500 and RE_READ_CMD.search(last_txt))
             STATE["consec_reads"] = (STATE["consec_reads"] + 1) if is_read else 0
             if STATE["consec_reads"] >= 3:
+                if STATE.get("fast_mode", False):
+                    STATE["fast_mode"] = False
                 if not os.path.isfile(PROGRESS_PATH):
                     runtime_hints.append("[AVISO ANTI-LOOP PROXY: Llevas 3+ lecturas seguidas sin crear C:\\Julio\\Agente\\progreso.md. DETEN lecturas, crea C:\\Julio\\Agente\\progreso.md YA y edita dentro de un script Python en Temp sin imprimir archivos largos.]")
                 else:
@@ -477,16 +508,20 @@ def prune_if_needed(messages: list, tools: list = None, approx_chars: int = None
             idx = next_idx
 
         if valid_cuts:
-            lo, hi = 0, len(valid_cuts) - 1
+            target_chars = int(KEEP_TARGET_TOKENS * 3.6)
+            def _msg_c(m):
+                return len(extract_text(m.get("content"))) + sum(len(str(((tc.get("function") or {}).get("name") or ""))) + len(str(((tc.get("function") or {}).get("arguments") or ""))) for tc in (m.get("tool_calls") or []))
+            base_chars = sum(_msg_c(m) for m in (sys_msgs + anchor)) + get_tools_chars(tools)
+            rest_lens = [_msg_c(m) for m in rest]
+            suffix_sum = sum(rest_lens)
             best_cut = valid_cuts[-1]
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                cut = valid_cuts[mid]
-                if count_tokens(sys_msgs + anchor + rest[cut:], tools) <= KEEP_TARGET_TOKENS:
+            prev_c = 0
+            for cut in valid_cuts:
+                suffix_sum -= sum(rest_lens[prev_c:cut])
+                prev_c = cut
+                if base_chars + suffix_sum <= target_chars:
                     best_cut = cut
-                    hi = mid - 1
-                else:
-                    lo = mid + 1
+                    break
             removed = rest[:best_cut]
             orph = sum(1 for m in removed if m.get("role") == "tool")
             dropped_orphan_tools += orph
@@ -519,15 +554,25 @@ def prune_if_needed(messages: list, tools: list = None, approx_chars: int = None
     return result, final_tokens, (total, final_tokens)
 
 
-def check_loop(sig_raw: str) -> str:
+def check_loop(sig_raw: str, prev_err: bool = False) -> str:
     if not sig_raw:
         return ""
-    digest = hashlib.sha1(sig_raw.encode("utf-8", errors="ignore")).hexdigest()
+    norm = re.sub(r"\d+", "#", sig_raw)
+    norm = re.sub(r'"[^"]*"|\x27[^\x27]*\x27', '""', norm)
+    digest = hashlib.sha1(norm.encode("utf-8", errors="ignore")).hexdigest()
     with STATE_LOCK:
-        if digest == STATE["last_sig"]:
+        recent = STATE.setdefault("recent_sigs", [])
+        is_repeat = digest in recent
+        recent.append(digest)
+        if len(recent) > 4:
+            del recent[0]
+        if is_repeat and not prev_err:
             STATE["repeat_count"] += 1
-            return f" [ALERTA LOOP x{STATE['repeat_count'] + 1}]"
-        STATE["last_sig"] = digest
+            escalated = ""
+            if STATE.get("fast_mode", False):
+                STATE["fast_mode"] = False
+                escalated = " [AUTO-DEEP]"
+            return f" [ALERTA LOOP x{STATE['repeat_count'] + 1}]{escalated}"
         STATE["repeat_count"] = 0
         return ""
 
@@ -576,9 +621,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         ctk = {}
                     ctk["enable_thinking"] = think_on
                     body["chat_template_kwargs"] = ctk
-                    cur_max = body.get("max_tokens")
-                    if not isinstance(cur_max, int) or cur_max <= 0 or cur_max > MAX_GEN_TOKENS:
-                        body["max_tokens"] = MAX_GEN_TOKENS
+                    if not think_on:
+                        body["temperature"] = 0.15
+                        body["top_p"] = 0.8
+                        body["presence_penalty"] = 0.0
+                        body["max_tokens"] = 4096
+                    else:
+                        cur_max = body.get("max_tokens")
+                        if not isinstance(cur_max, int) or cur_max <= 0 or cur_max > MAX_GEN_TOKENS:
+                            body["max_tokens"] = MAX_GEN_TOKENS
                     is_stream = bool(body.get("stream", False))
                     if is_stream:
                         stream_opts = body.get("stream_options")
@@ -586,16 +637,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             stream_opts = {}
                         stream_opts["include_usage"] = True
                         body["stream_options"] = stream_opts
+                    think_tag = "DEEP" if think_on else "FAST"
                     req_params = {
                         "temp": body.get("temperature", "def"),
                         "top_p": body.get("top_p", "def"),
                         "max_tok": body.get("max_tokens"),
                         "stream": is_stream,
-                        "think": "DEEP" if think_on else "FAST",
+                        "think": think_tag,
                     }
                 else:
                     req_params = {}
 
+                if "messages" in body and isinstance(body["messages"], list):
+                    for _m in body["messages"]:
+                        if isinstance(_m, dict) and _m.get("role") == "assistant":
+                            _m.pop("reasoning_content", None)
+                            _m.pop("reasoning", None)
                 if "messages" in body:
                     approx_c = None
                     if is_chat:
@@ -608,6 +665,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+        headers["Connection"] = "keep-alive"
         if raw_body is not None:
             headers["Content-Length"] = str(len(raw_body))
 
@@ -729,7 +787,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     sig_raw = f"TEXT:{out_text.strip()}"
 
                 alerts = []
-                loop_flag = check_loop(sig_raw).strip()
+                prev_err = bool(meta_in and 'ERR,' in meta_in.get('trigger_info', ''))
+                loop_flag = check_loop(sig_raw, prev_err).strip()
                 if loop_flag:
                     alerts.append(loop_flag)
                     with STATE_LOCK:
