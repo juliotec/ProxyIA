@@ -558,7 +558,7 @@ def check_loop(sig_raw: str, prev_err: bool = False) -> str:
     if not sig_raw:
         return ""
     norm = re.sub(r"\d+", "#", sig_raw)
-    norm = re.sub(r'"[^"]*"|\x27[^\x27]*\x27', '""', norm)
+    norm = re.sub(r'\becho\s+(?:"[^"]*"|\x27[^\x27]*\x27|\S+)', 'echo "', norm, flags=re.I)
     digest = hashlib.sha1(norm.encode("utf-8", errors="ignore")).hexdigest()
     with STATE_LOCK:
         recent = STATE.setdefault("recent_sigs", [])
@@ -567,6 +567,9 @@ def check_loop(sig_raw: str, prev_err: bool = False) -> str:
         if len(recent) > 4:
             del recent[0]
         if is_repeat and not prev_err:
+            if STATE["repeat_count"] < 1:
+                STATE["repeat_count"] += 1
+                return ""
             STATE["repeat_count"] += 1
             escalated = ""
             if STATE.get("fast_mode", False):
