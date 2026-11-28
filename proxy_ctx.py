@@ -13,10 +13,12 @@ TARGET = "http://127.0.0.1:1235"
 MAX_PROMPT_TOKENS = 61000   # Dispara limpieza antes de tocar los 65,536 de la 9070 XT
 KEEP_TARGET_TOKENS = 38000  # Conserva tus instrucciones completas + historial reciente con amplio margen
 MAX_GEN_TOKENS = 16384      # Evita bucles gigantes de escritura que llenen los 65,536 tokens
-FAST_SKIP_CHARS = 185000    # Debajo de ~185k chars (~51k tok reales) evita llamadas HTTP previas de tokenizado
+FAST_SKIP_CHARS = 155000    # Debajo de 155k chars (~43k tok reales) evita llamadas HTTP previas de tokenizado
 PROGRESS_PATH = r"C:\Julio\Agente\progreso.md"
 
-# Whitelist de herramientas permitidas (el resto de los 27 schemas de VS se filtran para ahorrar ~8,160 tokens):
+# Whitelist de herramientas permitidas (el resto de schemas se filtran para ahorrar VRAM):
+#
+# Visual Studio 2026 (27 schemas totales):
 #   Terminal:    powershell (3189c), read_powershell (1077c), stop_powershell (511c), list_powershell (410c)
 #   Archivos:    replace_string_in_file (3724c), multi_replace_string_in_file (1761c), get_file (1044c), view (860c), create_file (530c), remove_file (326c)
 #   Busqueda:    grep (1558c), glob (519c), semantic_code_search (498c)
@@ -24,7 +26,17 @@ PROGRESS_PATH = r"C:\Julio\Agente\progreso.md"
 #   Subagentes:  task (4411c), write_agent (2160c), read_agent (1330c), list_agents (1294c), task_complete (606c)
 #   Build/Tests: get_tests (868c), run_tests (676c), run_build (587c)
 #   IDE/Web:     ask_question (1388c), tool_search_tool (951c), skill (833c), web_fetch (734c)
-ALLOWED_TOOL_NAMES = {"powershell"}
+#
+# OpenCode v2.4+ (17 schemas totales):
+#   Terminal:    shell (1604c), bash (alias v1)
+#   CodeMode:    execute (1378c)
+#   Archivos:    read, write, edit, patch
+#   Busqueda:    grep, glob, list
+#   Web:         webfetch, websearch
+#   Tareas:      todowrite, todoread
+#   Subagentes:  task
+#   IDE/Skills:  skill (507c), question
+ALLOWED_TOOL_NAMES = {"powershell", "shell", "skill"}
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(SCRIPT_DIR, "proxy.log")
@@ -35,7 +47,6 @@ RE_MD = re.compile(r"[\w\-.]+\.md\b")
 RE_CODE = re.compile(r"[\w\-.]+\.(?:cpp|hpp|c|h|py|cs|yml|yaml|json|glsl|spv|bat|ps1)\b")
 
 SYS_CACHE = {"hash": "", "has_copilot": False, "md": [], "code": []}
-TOOLS_CACHE = {"id": None, "len": 0, "chars": 0}
 HTTP_OPENER = urllib.request.build_opener()
 
 STATE_LOCK = threading.Lock()
@@ -161,15 +172,7 @@ def filter_tools_schema(tools) -> tuple:
 def get_tools_chars(tools) -> int:
     if not isinstance(tools, list) or not tools:
         return 0
-    t_id = id(tools)
-    t_len = len(tools)
-    if TOOLS_CACHE["id"] == t_id and TOOLS_CACHE["len"] == t_len:
-        return TOOLS_CACHE["chars"]
-    c = len(json.dumps(tools, separators=(",", ":")))
-    TOOLS_CACHE["id"] = t_id
-    TOOLS_CACHE["len"] = t_len
-    TOOLS_CACHE["chars"] = c
-    return c
+    return len(json.dumps(tools, separators=(",", ":")))
 
 
 def post_json(endpoint: str, payload: dict) -> dict:
@@ -234,14 +237,28 @@ def is_real_user_msg(msg: dict) -> bool:
 
 
 def inject_hint_into_last_user(messages: list, hint: str) -> None:
-    if not hint:
+    if not hint or not messages:
         return
     for i in range(len(messages) - 1, -1, -1):
         if is_real_user_msg(messages[i]):
             m = dict(messages[i])
-            orig = extract_text(m.get("content"))
-            if hint not in orig:
-                m["content"] = orig + "\n\n" + hint
+            content = m.get("content")
+            if isinstance(content, str):
+                if hint not in content:
+                    m["content"] = content + "\n\n" + hint
+                    messages[i] = m
+            elif isinstance(content, list):
+                parts = [dict(part) if isinstance(part, dict) else part for part in content]
+                attached = False
+                for part in reversed(parts):
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        if hint not in part["text"]:
+                            part["text"] = part["text"] + "\n\n" + hint
+                        attached = True
+                        break
+                if not attached:
+                    parts.append({"type": "text", "text": hint})
+                m["content"] = parts
                 messages[i] = m
             break
 
@@ -268,10 +285,6 @@ def apply_thinking_switch(messages: list) -> bool:
     if not messages:
         return True
 
-    if messages[-1].get("role") == "tool":
-        with STATE_LOCK:
-            return not STATE.get("fast_mode", False)
-
     last_user_idx = -1
     for i in range(len(messages) - 1, -1, -1):
         if is_real_user_msg(messages[i]):
@@ -279,6 +292,8 @@ def apply_thinking_switch(messages: list) -> bool:
             break
 
     if last_user_idx == -1:
+        with STATE_LOCK:
+            STATE["fast_mode"] = False
         return True
 
     target = dict(messages[last_user_idx])
@@ -343,16 +358,20 @@ def inspect_incoming(messages: list, tools: list = None, req_params: dict = None
 
     sys_joined = "\n".join(sys_texts)
     sys_digest = hashlib.sha1(sys_joined.encode("utf-8", errors="ignore")).hexdigest()
-    if sys_digest != SYS_CACHE["hash"]:
-        SYS_CACHE["hash"] = sys_digest
-        SYS_CACHE["has_copilot"] = ("Copilot Instructions" in sys_joined) or ("UPSTREAM.md" in sys_joined)
-        SYS_CACHE["md"] = sorted(set(RE_MD.findall(sys_joined)))
-        SYS_CACHE["code"] = sorted(set(RE_CODE.findall(sys_joined)))
+    sys_snap = SYS_CACHE
+    if sys_digest != sys_snap["hash"]:
+        sys_snap = {
+            "hash": sys_digest,
+            "has_copilot": ("Copilot Instructions" in sys_joined) or ("UPSTREAM.md" in sys_joined),
+            "md": sorted(set(RE_MD.findall(sys_joined))),
+            "code": sorted(set(RE_CODE.findall(sys_joined))),
+        }
+        globals()["SYS_CACHE"] = sys_snap
 
     non_sys_joined = "\n".join(non_sys_texts)
-    has_copilot = SYS_CACHE["has_copilot"] or ("Copilot Instructions" in non_sys_joined) or ("UPSTREAM.md" in non_sys_joined)
-    md_files = sorted(set(SYS_CACHE["md"]) | set(RE_MD.findall(non_sys_joined)))
-    code_files = sorted(set(SYS_CACHE["code"]) | set(RE_CODE.findall(non_sys_joined)))
+    has_copilot = sys_snap["has_copilot"] or ("Copilot Instructions" in non_sys_joined) or ("UPSTREAM.md" in non_sys_joined)
+    md_files = sorted(set(sys_snap["md"]) | set(RE_MD.findall(non_sys_joined)))
+    code_files = sorted(set(sys_snap["code"]) | set(RE_CODE.findall(non_sys_joined)))
 
     last_msg, last_txt = non_sys[-1] if non_sys else ({}, "")
     last_role = last_msg.get("role", "")
@@ -393,10 +412,21 @@ def inspect_incoming(messages: list, tools: list = None, req_params: dict = None
             if STATE["order_num"] == 0:
                 STATE["order_num"] = 1
             STATE["step_num"] += 1
+            if STATE.get("ide_compacted"):
+                STATE["ide_compacted"] = False
+                prog_now = read_active_progress()
+                if prog_now:
+                    runtime_hints.append("[AVISO PROXY POST-COMPACTACION: NO vuelvas a leer archivos completos ni empieces desde cero. Continua desde el primer [ ] pendiente de C:\\Julio\\Agente\\progreso.md:]\n" + prog_now)
+                else:
+                    runtime_hints.append("[AVISO PROXY POST-COMPACTACION: Visual Studio compacto el historial. NO vuelvas a leer archivos largos. Crea C:\\Julio\\Agente\\progreso.md YA como primera accion y ejecuta los cambios via script Python en C:\\Julio\\Agente\\Temp sin imprimir archivos largos.]")
             label = f"[ORDEN #{STATE['order_num']} | PASO #{STATE['step_num']}]"
             t_name = last_msg.get("name") or last_role or "step"
             low = last_txt.lower()
-            is_err = any(k in low for k in ("error", "traceback", "exception", "failed", "fallo"))
+            is_err = (
+                ("completed with exit code " in low and "completed with exit code 0" not in low)
+                or "traceback (most recent call last):" in low
+                or "unicodeencodeerror:" in low
+            )
             status_tag = "ERR" if is_err else "OK"
             trigger_info = f'PrevTool({t_name}={status_tag}, {len(last_txt)}c): "{compact_snippet(last_txt, 200)}"'
             is_read = t_name in ("get_file", "view", "view_range", "grep") or (t_name == "powershell" and len(last_txt) > 3500 and RE_READ_CMD.search(last_txt))
@@ -409,8 +439,11 @@ def inspect_incoming(messages: list, tools: list = None, req_params: dict = None
                 else:
                     runtime_hints.append("[AVISO ANTI-LOOP PROXY: Llevas 3+ lecturas seguidas. No imprimas mas texto largo; ejecuta ya el siguiente [ ] de C:\\Julio\\Agente\\progreso.md con un script Python en Temp.]")
 
+    injected_chars = 0
     if runtime_hints:
-        inject_hint_into_last_user(messages, "\n\n".join(runtime_hints))
+        joined_hints = "\n\n".join(runtime_hints)
+        inject_hint_into_last_user(messages, joined_hints)
+        injected_chars = len(joined_hints) + 2
 
     tools_chars = get_tools_chars(tools)
     orig_schemas, saved_schema_chars = tools_filter_info
@@ -419,7 +452,7 @@ def inspect_incoming(messages: list, tools: list = None, req_params: dict = None
         "label": label,
         "has_copilot": has_copilot,
         "sys_chars": role_chars["sys"],
-        "all_chars": role_chars["sys"] + role_chars["user"] + role_chars["asst"] + role_chars["tool"] + tools_chars,
+        "all_chars": role_chars["sys"] + role_chars["user"] + role_chars["asst"] + role_chars["tool"] + tools_chars + injected_chars,
         "md_files": md_files,
         "code_files": code_files,
         "roles": role_counts,
@@ -497,12 +530,16 @@ def prune_if_needed(messages: list, tools: list = None, approx_chars: int = None
                 progress_attached = True
         anchor = [anchor_msg]
 
-    if len(rest) > 4:
+    while rest and rest[0].get("role") == "tool":
+        rest.pop(0)
+        dropped_orphan_tools += 1
+
+    if len(rest) > 2:
         valid_cuts = []
         idx = 0
-        while idx < len(rest) - 4:
+        while idx < len(rest) - 2:
             next_idx = idx + 1
-            while next_idx < len(rest) - 4 and rest[next_idx].get("role") == "tool":
+            while next_idx < len(rest) - 2 and rest[next_idx].get("role") == "tool":
                 next_idx += 1
             valid_cuts.append(next_idx)
             idx = next_idx
@@ -540,6 +577,21 @@ def prune_if_needed(messages: list, tools: list = None, approx_chars: int = None
         if count_tokens(sys_msgs + anchor + rest, tools) > MAX_PROMPT_TOKENS and anchor:
             if trim_msg_content(anchor[0], 10000):
                 extreme_trimmed += 1
+        if count_tokens(sys_msgs + anchor + rest, tools) > MAX_PROMPT_TOKENS:
+            for msg in anchor + rest:
+                if trim_msg_content(msg, 3500):
+                    extreme_trimmed += 1
+                    if count_tokens(sys_msgs + anchor + rest, tools) <= MAX_PROMPT_TOKENS:
+                        break
+        while len(rest) > 1 and count_tokens(sys_msgs + anchor + rest, tools) > MAX_PROMPT_TOKENS:
+            popped = rest.pop(0)
+            if popped.get("role") == "tool":
+                dropped_orphan_tools += 1
+            else:
+                dropped_msgs += 1
+            while rest and rest[0].get("role") == "tool":
+                rest.pop(0)
+                dropped_orphan_tools += 1
 
     result = sys_msgs + anchor + rest
     final_tokens = count_tokens(result, tools)
@@ -616,6 +668,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     filtered_tools, orig_cnt, saved_c = filter_tools_schema(body["tools"])
                     body["tools"] = filtered_tools
                     tools_filter_info = (orig_cnt, saved_c)
+                    tc_req = body.get("tool_choice")
+                    if isinstance(tc_req, dict):
+                        tc_fn = (tc_req.get("function") or {}).get("name") or tc_req.get("name")
+                        if tc_fn and tc_fn not in ALLOWED_TOOL_NAMES:
+                            body["tool_choice"] = "auto"
 
                 if is_chat:
                     think_on = apply_thinking_switch(body.get("messages") or [])
@@ -656,7 +713,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         if isinstance(_m, dict) and _m.get("role") == "assistant":
                             _m.pop("reasoning_content", None)
                             _m.pop("reasoning", None)
-                if "messages" in body:
+                if "messages" in body and isinstance(body["messages"], list):
+                    _cleaned_msgs = []
+                    _seen_tc = False
+                    for _msg_t in body["messages"]:
+                        if not isinstance(_msg_t, dict):
+                            continue
+                        _r_t = _msg_t.get("role")
+                        if _r_t == "assistant":
+                            _seen_tc = bool(_msg_t.get("tool_calls"))
+                            _cleaned_msgs.append(_msg_t)
+                        elif _r_t == "tool":
+                            if _seen_tc:
+                                trim_msg_content(_msg_t, 12000)
+                                _cleaned_msgs.append(_msg_t)
+                        else:
+                            _seen_tc = False
+                            _cleaned_msgs.append(_msg_t)
+                    body["messages"] = _cleaned_msgs
                     approx_c = None
                     if is_chat:
                         meta_in = inspect_incoming(body["messages"], body.get("tools"), req_params, tools_filter_info)
@@ -665,8 +739,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         body["messages"], body.get("tools"), approx_c
                     )
                 raw_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
-            except Exception:
-                pass
+            except Exception as _e_body:
+                log_line(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY-ERR] Error procesando request: {_e_body}")
 
         headers["Connection"] = "keep-alive"
         if raw_body is not None:
@@ -685,7 +759,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         req = urllib.request.Request(url, data=raw_body, headers=headers, method=self.command)
         try:
-            with HTTP_OPENER.open(req, timeout=600) as resp:
+            with HTTP_OPENER.open(req, timeout=None) as resp:
                 self.send_response(resp.status)
                 for k, v in resp.headers.items():
                     if k.lower() not in ("transfer-encoding", "connection"):
@@ -723,7 +797,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                         if isinstance(c_txt, str):
                                             out_parts.append(c_txt)
                                         for tc in delta.get("tool_calls") or []:
-                                            idx = tc.get("index", 0)
+                                            idx = tc.get("index") if tc.get("index") is not None else 0
                                             entry = tool_calls_acc.setdefault(idx, {"name": "", "args": []})
                                             fn = tc.get("function") or {}
                                             if fn.get("name"):

@@ -38,11 +38,11 @@ echo Iniciando Qwen3.8-27B en RX 9070 XT (ROCm) - Puerto interno 1235...
 echo Carpeta BAT : %BAT_DIR%
 echo Binario     : %LLAMA_DIR%
 echo Modelo      : %MODEL_PATH%
-echo Endpoint    : http://localhost:1234/v1 (Proxy 61K->48K + /fast + Reasoning 4096)
+echo Endpoint    : http://localhost:1234/v1 (Proxy 61K->38K + !fast + Reasoning 4096)
 echo Log         : %LOG_FILE%
 echo.
 
-start "llama-server-rocm" /D "%LLAMA_DIR%" "%LLAMA_DIR%\llama-server.exe" -m "%MODEL_PATH%" --alias qwen3.8-27b -t 8 -ngl 99 -c 65536 -b 2048 -ub 1024 -fa on -ctk q8_0 -ctv q4_0 -np 1 --spec-type draft-mtp --spec-draft-n-max 6 --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.05 --presence-penalty 0.2 --repeat-penalty 1.05 --jinja --reasoning-format deepseek --reasoning-budget 4096 --reasoning-preserve --cache-ram 8192 --log-file "%LOG_FILE%" --port 1235
+start "llama-server-rocm" /D "%LLAMA_DIR%" "%LLAMA_DIR%\llama-server.exe" -m "%MODEL_PATH%" --alias qwen3.8-27b -t 8 -ngl 99 -lm none -c 65536 -b 1024 -ub 512 -fa on -ctk q8_0 -ctv q4_0 -np 1 --spec-type draft-mtp --spec-draft-n-max 6 --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.05 --presence-penalty 0.5 --repeat-penalty 1.05 --jinja --reasoning-format deepseek --reasoning-budget 4096 --no-reasoning-preserve --cache-ram 0 --log-file "%LOG_FILE%" --port 1235
 
 timeout /t 4 /nobreak >nul
 
