@@ -33,7 +33,8 @@
       "name": "Local ROCm (RX 9070 XT)",
       "options": {
         "baseURL": "http://127.0.0.1:1234/v1",
-        "apiKey": "sk-local"
+        "apiKey": "sk-local",
+        "timeout": 900000
       },
       "models": {
         "qwen3.8-27b": {
